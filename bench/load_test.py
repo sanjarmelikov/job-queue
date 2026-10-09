@@ -8,8 +8,9 @@ Two modes:
   --rate R:   enqueue R jobs/second (in small batches) for --seconds; measures how long
               each job waited between enqueue and a worker starting it (p50/p95/p99).
   --burst N:  enqueue N jobs at once, then time how fast the workers drain them.
-Latencies come from the database's own timestamps (enqueued_at, first_started_at),
-so they include everything: commit, NOTIFY/poll wake-up, and the claim query.
+Latencies and throughput come from the database's own timestamps (enqueued_at,
+first_started_at, finished_at), so they include everything (commit, NOTIFY/poll
+wake-up, the claim query) and can't be skewed by when the producer finished.
 """
 
 from __future__ import annotations
@@ -45,6 +46,18 @@ def wait_for_drain(q: Queue, total: int, timeout: float) -> float:
             return time.monotonic() - start
         time.sleep(0.02)
     raise TimeoutError(f"only {q.stats()['done']} of {total} jobs done after {timeout}s")
+
+
+def processing_throughput(dsn: str) -> float:
+    """Jobs per second over the span from the first job start to the last job finish, from
+    the database's own timestamps. Unlike a wall-clock timer around the test, this can't
+    miss jobs drained while the producer was still enqueueing, and needs no polling."""
+    with psycopg.connect(dsn) as conn:
+        n, span = conn.execute(
+            "SELECT count(*), extract(epoch FROM max(finished_at) - min(first_started_at)) "
+            "FROM jobs WHERE status = 'done'"
+        ).fetchone()
+    return n / float(span)
 
 
 def latency_stats(dsn: str) -> dict:
@@ -115,7 +128,8 @@ def main() -> None:
         "jobs": total,
         "target_rate": args.rate,
         "achieved_enqueue_rate": round(enqueue_rate, 1) if enqueue_rate else None,
-        "throughput_jobs_per_s": round(total / elapsed, 1),
+        "throughput_jobs_per_s": round(processing_throughput(args.dsn), 1),
+        "wall_seconds": round(elapsed, 2),
         **latency_stats(args.dsn),
         "label": args.label,
         "commit": subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
