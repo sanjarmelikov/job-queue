@@ -1,0 +1,25 @@
+# Postgres + 8 workers:  docker compose up --scale worker=8
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+  migrate:
+    build: .
+    command: ["init-db"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+    depends_on:
+      db: {condition: service_healthy}
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped  # a crashed worker comes back; its leased jobs are re-delivered
