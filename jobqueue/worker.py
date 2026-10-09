@@ -26,6 +26,11 @@ from jobqueue.queue import connect, notify_channel
 
 log = logging.getLogger(__name__)
 
+# Fault injection (tests/benchmarks only): crash the process right after a job's
+# side effects commit but before the ack, the worst possible moment. The job
+# will be re-delivered, so this proves duplicates are harmless.
+CRASH_AFTER_COMMIT = float(os.environ.get("JOBQUEUE_CRASH_AFTER_COMMIT", "0"))
+
 # Claim up to `batch` runnable jobs and lease them to this worker, in one statement.
 # FOR UPDATE SKIP LOCKED: rows another worker is claiming right now are skipped
 # instead of waited on, so concurrent workers never block each other and never
@@ -139,6 +144,8 @@ class Worker:
         try:
             self.handler(job, self.handler_conn)
             self.handler_conn.commit()
+            if CRASH_AFTER_COMMIT and random.random() < CRASH_AFTER_COMMIT:
+                os._exit(137)  # like SIGKILL: effects are committed, the ack never happens
         except Exception as exc:  # noqa: BLE001 - any handler failure means retry or dead-letter
             self.handler_conn.rollback()
             error = f"{type(exc).__name__}: {exc}"[:2000]

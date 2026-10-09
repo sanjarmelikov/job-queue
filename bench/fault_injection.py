@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -27,15 +28,17 @@ from jobqueue.queue import Queue
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def start_worker(dsn: str, visibility: float) -> subprocess.Popen:
+def start_worker(dsn: str, visibility: float, crash_after_commit: float = 0.0) -> subprocess.Popen:
+    env = os.environ | {"JOBQUEUE_CRASH_AFTER_COMMIT": str(crash_after_commit)}
     return subprocess.Popen(
         [sys.executable, "-m", "jobqueue", "worker", "--dsn", dsn, "--batch", "5",
          "--visibility-timeout", str(visibility), "--poll-interval", "0.2"],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
 
 
-def run(dsn: str, jobs: int, workers: int, kill_every: float, visibility: float, timeout: float) -> dict:
+def run(dsn: str, jobs: int, workers: int, kill_every: float, visibility: float, timeout: float,
+        crash_after_commit: float = 0.0) -> dict:
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute("TRUNCATE jobs, dead_letters, effects")
     q = Queue(dsn)
@@ -46,8 +49,8 @@ def run(dsn: str, jobs: int, workers: int, kill_every: float, visibility: float,
             idempotency_keys=[f"job-{i}" for i in range(start, start + n)],
         )
 
-    procs = [start_worker(dsn, visibility) for _ in range(workers)]
-    kills = 0
+    procs = [start_worker(dsn, visibility, crash_after_commit) for _ in range(workers)]
+    kills = self_crashes = 0
     began = time.monotonic()
     next_kill = began + kill_every
     try:
@@ -55,11 +58,15 @@ def run(dsn: str, jobs: int, workers: int, kill_every: float, visibility: float,
             stats = q.stats()
             if stats["done"] + stats["dead"] == jobs:
                 break
+            for i, p in enumerate(procs):  # workers that crashed themselves get replaced too
+                if p.poll() is not None:
+                    procs[i] = start_worker(dsn, visibility, crash_after_commit)
+                    self_crashes += 1
             if time.monotonic() >= next_kill:
                 victim = random.randrange(len(procs))
                 procs[victim].kill()  # SIGKILL: the worker gets no chance to ack or roll back
                 procs[victim].wait()
-                procs[victim] = start_worker(dsn, visibility)
+                procs[victim] = start_worker(dsn, visibility, crash_after_commit)
                 kills += 1
                 next_kill = time.monotonic() + kill_every
             time.sleep(0.05)
@@ -81,6 +88,8 @@ def run(dsn: str, jobs: int, workers: int, kill_every: float, visibility: float,
         "jobs": jobs,
         "workers": workers,
         "kills": kills,
+        "crashes_after_commit": self_crashes,
+        "crash_after_commit_prob": crash_after_commit,
         "visibility_timeout_s": visibility,
         "seconds": round(elapsed, 1),
         "done": stats["done"],
@@ -100,9 +109,12 @@ def main() -> None:
     parser.add_argument("--kill-every", type=float, default=0.5, help="seconds between SIGKILLs")
     parser.add_argument("--visibility", type=float, default=2.0, help="lease length, seconds")
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--crash-after-commit", type=float, default=0.0,
+                        help="probability a worker crashes between committing a job's effects and acking it")
     parser.add_argument("--out", type=Path, default=ROOT / "results" / "fault_injection.jsonl")
     args = parser.parse_args()
-    result = run(args.dsn, args.jobs, args.workers, args.kill_every, args.visibility, args.timeout)
+    result = run(args.dsn, args.jobs, args.workers, args.kill_every, args.visibility, args.timeout,
+                 args.crash_after_commit)
     result["commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                                       capture_output=True, text=True).stdout.strip()
     result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
