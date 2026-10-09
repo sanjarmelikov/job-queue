@@ -28,11 +28,13 @@ from jobqueue.queue import Queue
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def start_workers(dsn: str, n: int, batch: int, skip_locked: bool) -> list[subprocess.Popen]:
+def start_workers(dsn: str, n: int, batch: int, skip_locked: bool, ack_each: bool = False) -> list[subprocess.Popen]:
     cmd = [sys.executable, "-m", "jobqueue", "worker", "--dsn", dsn, "--handler", "jobqueue.examples:noop",
            "--batch", str(batch), "--poll-interval", "0.1"]
     if not skip_locked:
         cmd.append("--no-skip-locked")
+    if ack_each:
+        cmd.append("--ack-each")
     return [subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(n)]
 
 
@@ -65,6 +67,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--batch", type=int, default=10, help="jobs claimed per query")
     parser.add_argument("--no-skip-locked", action="store_true")
+    parser.add_argument("--ack-each", action="store_true")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--rate", type=float, help="steady enqueue rate, jobs/second")
     mode.add_argument("--burst", type=int, help="enqueue this many at once, then drain")
@@ -77,7 +80,7 @@ def main() -> None:
         conn.execute("TRUNCATE jobs, dead_letters")
         conn.execute("VACUUM ANALYZE jobs")
     q = Queue(args.dsn)
-    workers = start_workers(args.dsn, args.workers, args.batch, not args.no_skip_locked)
+    workers = start_workers(args.dsn, args.workers, args.batch, not args.no_skip_locked, args.ack_each)
     time.sleep(1.0)  # let workers connect and start listening
     try:
         if args.burst:
@@ -108,6 +111,7 @@ def main() -> None:
         "workers": args.workers,
         "batch": args.batch,
         "skip_locked": not args.no_skip_locked,
+        "ack": "each" if args.ack_each else "batch",
         "jobs": total,
         "target_rate": args.rate,
         "achieved_enqueue_rate": round(enqueue_rate, 1) if enqueue_rate else None,

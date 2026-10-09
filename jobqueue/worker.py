@@ -64,6 +64,13 @@ ACK_SQL = """
 UPDATE jobs SET status = 'done', finished_at = now(), locked_by = NULL
 WHERE id = %(id)s AND locked_by = %(worker)s AND attempts = %(attempts)s AND status = 'running'
 """
+# Acknowledge a whole batch in one statement (one transaction, one WAL flush),
+# with the same fencing per job as ACK_SQL.
+ACK_MANY_SQL = """
+UPDATE jobs SET status = 'done', finished_at = now(), locked_by = NULL
+FROM unnest(%(ids)s::bigint[], %(attempts)s::int[]) AS a(id, attempts)
+WHERE jobs.id = a.id AND jobs.attempts = a.attempts AND jobs.locked_by = %(worker)s AND jobs.status = 'running'
+"""
 RETRY_SQL = """
 UPDATE jobs SET status = 'queued', run_at = now() + make_interval(secs => %(delay)s),
     locked_by = NULL, last_error = %(error)s
@@ -111,6 +118,7 @@ class Worker:
         visibility_timeout: float = 30.0,
         poll_interval: float = 1.0,
         skip_locked: bool = True,
+        ack_batch: bool = True,
         name: str | None = None,
     ):
         self.dsn = dsn
@@ -120,6 +128,9 @@ class Worker:
         self.visibility_timeout = visibility_timeout
         self.poll_interval = poll_interval
         self.claim_sql = CLAIM_SQL if skip_locked else CLAIM_SQL_BLOCKING
+        # True: ack a claimed batch with one UPDATE after running it (fewer round trips;
+        # a crash mid-batch re-delivers the batch's finished jobs, which idempotency absorbs).
+        self.ack_batch = ack_batch
         self.name = name or f"{socket.gethostname()}:{os.getpid()}"
         self.conn = connect(dsn)  # claims, acks, retries
         self.handler_conn = psycopg.connect(dsn)  # handlers run their own transactions here
@@ -139,7 +150,8 @@ class Worker:
         ).fetchall()
         return [Job(*row) for row in rows]
 
-    def process(self, job: Job) -> None:
+    def process(self, job: Job, defer_ack: bool = False) -> bool:
+        """Run one job. Returns True if it succeeded; with defer_ack the caller acks it later."""
         params = {"id": job.id, "worker": self.name, "attempts": job.attempts}
         try:
             self.handler(job, self.handler_conn)
@@ -154,11 +166,30 @@ class Worker:
                 log.warning("job %d dead after %d attempts: %s", job.id, job.attempts, error)
             else:
                 self.conn.execute(RETRY_SQL, params | {"delay": backoff_seconds(job.attempts), "error": error})
-            return
+            return False
+        if defer_ack:
+            return True
         if self.conn.execute(ACK_SQL, params).rowcount == 0:
             # Our lease expired and someone else took the job: it will run (again) there.
             log.warning("job %d: lease lost before ack; another worker owns it now", job.id)
         self.processed += 1
+        return True
+
+    def process_batch(self, jobs: list[Job]) -> None:
+        if not self.ack_batch:
+            for job in jobs:
+                self.process(job)
+            return
+        done = [job for job in jobs if self.process(job, defer_ack=True)]
+        if not done:
+            return
+        acked = self.conn.execute(
+            ACK_MANY_SQL,
+            {"ids": [j.id for j in done], "attempts": [j.attempts for j in done], "worker": self.name},
+        ).rowcount
+        if acked < len(done):
+            log.warning("%d of %d jobs: lease lost before ack", len(done) - acked, len(done))
+        self.processed += acked
 
     def wait_for_work(self) -> None:
         """Sleep until a NOTIFY arrives or poll_interval passes (delayed retries need the poll)."""
@@ -177,8 +208,7 @@ class Worker:
                 self.wait_for_work()
                 continue
             idle_since = time.monotonic()
-            for job in jobs:
-                self.process(job)
+            self.process_batch(jobs)
         return self.processed
 
     def close(self) -> None:

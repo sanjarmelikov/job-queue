@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> None:
     w.add_argument("--visibility-timeout", type=float, default=30.0)
     w.add_argument("--poll-interval", type=float, default=1.0)
     w.add_argument("--no-skip-locked", action="store_true", help="benchmark: plain FOR UPDATE claims")
+    w.add_argument("--ack-each", action="store_true", help="ack every job separately instead of per batch")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -47,6 +48,7 @@ def main(argv: list[str] | None = None) -> None:
         visibility_timeout=args.visibility_timeout,
         poll_interval=args.poll_interval,
         skip_locked=not args.no_skip_locked,
+        ack_batch=not args.ack_each,
     )
 
 

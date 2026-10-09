@@ -136,3 +136,23 @@ def test_handler_error_is_recorded(dsn, bad):
     [dead] = q.dead_letters()
     assert "invalid input syntax" in dead["last_error"] or "InvalidTextRepresentation" in dead["last_error"]
     w.close()
+
+
+@pytest.mark.parametrize("ack_batch", [True, False])
+def test_batch_and_single_acks_finish_every_job_once(dsn, ack_batch):
+    q = Queue(dsn)
+    q.enqueue_many([{"value": i} for i in range(55)], idempotency_keys=[f"b{i}" for i in range(55)])
+    w = Worker(dsn, record_effect, batch=10, ack_batch=ack_batch, poll_interval=0.05)
+    assert w.run(idle_exit=0.5) == 55
+    assert q.stats()["done"] == 55 and set(effects(dsn).values()) == {1}
+    w.close()
+
+
+def test_batch_ack_skips_failed_jobs(dsn):
+    q = Queue(dsn)
+    q.enqueue_many([{"succeed_on": 1}, {"succeed_on": 99}, {"succeed_on": 1}],
+                   idempotency_keys=["ok1", "bad", "ok2"], max_attempts=1)
+    w = Worker(dsn, flaky, batch=10, poll_interval=0.05)
+    w.run(idle_exit=0.5)
+    assert q.stats() == {"queued": 0, "running": 0, "done": 2, "dead": 1}
+    w.close()
