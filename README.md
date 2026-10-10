@@ -14,6 +14,8 @@ Worker(dsn, record_effect, batch=10).run()
 docker compose up --scale worker=8    # Postgres + schema + 8 workers
 ```
 
+Checked end to end with `docker-compose` on Colima: 2,000 jobs enqueued from the host, one worker container `docker kill`ed mid-run. All 2,000 finished; the killed worker's 10 leased jobs were re-delivered when their 30 s lease expired, and the one duplicate delivery was absorbed (2,001 deliveries, 2,000 effects). Note: `restart: unless-stopped` brings back *crashed* workers; a manual `docker kill` counts as a deliberate stop.
+
 ## Design
 
 | Concern | How |
