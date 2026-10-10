@@ -66,7 +66,20 @@ Every job finished, and every effect row exists exactly once. Results: `results/
 - **Lock contention:** without `SKIP LOCKED`, workers queue behind each other's row locks on the same head-of-queue jobs. With it, they each take different rows. The plain `FOR UPDATE` variant is also unstable (one run at 43K/s, the others 6–7K/s), which is why medians are reported.
 - **Batched acks:** with per-job acks, every job's acknowledgement was its own transaction and WAL flush. One `UPDATE` per batch removed most of those round trips. Tradeoff: if a worker dies mid-batch, the batch's finished-but-unacked jobs are re-delivered (absorbed by idempotency).
 
-**Not yet measured:** enqueue-to-start latency under steady load. The runs attempted for this were invalidated because the laptop went into system sleep mid-run (confirmed in `pmset -g log`), and they'll be re-run on an awake machine on AC power.
+### Latency under steady load
+
+Same setup, but a producer enqueues at a fixed rate for 15 s while the 8 workers run. "Wait" is enqueue-to-start time from the database's timestamps (`first_started_at - enqueued_at`), so it includes commit, NOTIFY wake-up and the claim query. Commit `12527d4`, run 2026-10-10 under `caffeinate` (an earlier attempt was discarded after `pmset -g log` showed the machine had slept mid-run).
+
+| Enqueue rate | Throughput | Wait p50 | Wait p95 | Wait p99 |
+|---:|---:|---:|---:|---:|
+| 1,000 jobs/s | 1,002 | 1.1 ms | 2.1 ms | 6.2 ms |
+| 2,000 jobs/s | 2,002 | 1.3 ms | 2.0 ms | 2.7 ms |
+| 3,000 jobs/s | 3,004 | 1.6 ms | 3.0 ms | 8.6 ms |
+| 4,000 jobs/s | 4,004 | 1.7 ms | 2.7 ms | 6.8 ms |
+| 5,000 jobs/s | 5,005 | 1.6 ms | **4.0 ms** | 7.8 ms |
+| 6,000 jobs/s | 6,010 | 3.1 ms | 25.7 ms | 51.3 ms |
+
+Workers keep up at every rate. p95 stays under 4 ms up to 5,000 jobs/s, thanks to LISTEN/NOTIFY wake-ups; at 6,000 jobs/s the tail grows as the producer, Postgres and 8 workers compete for the same 8 cores (the burst drain above, with no producer competing, reaches about 24K jobs/s).
 
 ## Limitations
 
