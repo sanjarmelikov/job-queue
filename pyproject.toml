@@ -1,0 +1,23 @@
+[project]
+name = "jobqueue"
+version = "0.1.0"
+description = "Durable PostgreSQL-backed job queue with at-least-once delivery"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jobqueue*"]
+
+[tool.setuptools.package-data]
+jobqueue = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120  # a hung test fails instead of stalling the suite

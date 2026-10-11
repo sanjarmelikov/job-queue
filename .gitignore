@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local benchmark database
+.pgdata/
+
+# Personal study notes (not published)
+notes/

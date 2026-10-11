@@ -1,0 +1,294 @@
+"""Consumer side: claim jobs, run handlers, acknowledge or retry.
+
+Delivery is at-least-once. A job is leased to one worker for `visibility_timeout`
+seconds; if the worker dies before acknowledging, the lease runs out and another
+worker runs the job again. So handlers must be idempotent: running a job twice
+must have the same effect as running it once. Idempotency keys (see
+`examples.py`) are the standard way to get there.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import random
+import select
+import signal
+import socket
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+import psycopg
+from psycopg import sql
+
+from jobqueue.queue import connect, notify_channel
+
+log = logging.getLogger(__name__)
+
+# Fault injection (tests/benchmarks only): crash the process right after a job's
+# side effects commit but before the ack, the worst possible moment. The job
+# will be re-delivered, so this proves duplicates are harmless.
+CRASH_AFTER_COMMIT = float(os.environ.get("JOBQUEUE_CRASH_AFTER_COMMIT", "0"))
+
+# Claim up to `batch` runnable jobs and lease them to this worker, in one statement.
+# FOR UPDATE SKIP LOCKED: rows another worker is claiming right now are skipped
+# instead of waited on, so concurrent workers never block each other and never
+# take the same job.
+CLAIM_SQL = """
+WITH next AS (
+    SELECT id FROM jobs
+    WHERE queue = %(queue)s AND status <> 'done' AND run_at <= now()
+    ORDER BY run_at
+    LIMIT %(batch)s
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs SET
+    status = 'running',
+    attempts = jobs.attempts + 1,
+    run_at = now() + make_interval(secs => %(visibility)s),
+    locked_by = %(worker)s,
+    first_started_at = coalesce(jobs.first_started_at, now())
+FROM next
+WHERE jobs.id = next.id
+RETURNING jobs.id, jobs.payload, jobs.attempts, jobs.max_attempts, jobs.idempotency_key
+"""
+
+# Variant without SKIP LOCKED, kept for the contention benchmark: workers queue
+# up behind each other's row locks on the same head-of-queue rows.
+CLAIM_SQL_BLOCKING = CLAIM_SQL.replace("FOR UPDATE SKIP LOCKED", "FOR UPDATE")
+
+# Both guarded by (locked_by, attempts): a worker whose lease expired and whose job
+# was re-claimed by someone else can't mark that newer attempt done or failed.
+ACK_SQL = """
+UPDATE jobs SET status = 'done', finished_at = now(), locked_by = NULL
+WHERE id = %(id)s AND locked_by = %(worker)s AND attempts = %(attempts)s AND status = 'running'
+"""
+# Acknowledge a whole batch in one statement (one transaction, one WAL flush),
+# with the same fencing per job as ACK_SQL.
+ACK_MANY_SQL = """
+UPDATE jobs SET status = 'done', finished_at = now(), locked_by = NULL
+FROM unnest(%(ids)s::bigint[], %(attempts)s::int[]) AS a(id, attempts)
+WHERE jobs.id = a.id AND jobs.attempts = a.attempts AND jobs.locked_by = %(worker)s AND jobs.status = 'running'
+"""
+# Extend the lease of jobs this worker is still running (same fencing as acks).
+HEARTBEAT_SQL = """
+UPDATE jobs SET run_at = now() + make_interval(secs => %(visibility)s)
+FROM unnest(%(ids)s::bigint[], %(attempts)s::int[]) AS a(id, attempts)
+WHERE jobs.id = a.id AND jobs.attempts = a.attempts AND jobs.locked_by = %(worker)s AND jobs.status = 'running'
+"""
+RETRY_SQL = """
+UPDATE jobs SET status = 'queued', run_at = now() + make_interval(secs => %(delay)s),
+    locked_by = NULL, last_error = %(error)s
+WHERE id = %(id)s AND locked_by = %(worker)s AND attempts = %(attempts)s AND status = 'running'
+"""
+DEAD_SQL = """
+WITH gone AS (
+    DELETE FROM jobs
+    WHERE id = %(id)s AND locked_by = %(worker)s AND attempts = %(attempts)s AND status = 'running'
+    RETURNING id, queue, payload, attempts, idempotency_key, enqueued_at
+)
+INSERT INTO dead_letters (id, queue, payload, attempts, idempotency_key, last_error, enqueued_at)
+SELECT id, queue, payload, attempts, idempotency_key, %(error)s, enqueued_at FROM gone
+"""
+
+
+@dataclass
+class Job:
+    id: int
+    payload: dict[str, Any]
+    attempts: int
+    max_attempts: int
+    idempotency_key: str | None
+
+
+Handler = Callable[[Job, psycopg.Connection], None]
+
+
+def backoff_seconds(attempt: int, base: float = 0.5, cap: float = 60.0) -> float:
+    """Exponential backoff with full jitter: random in [0, min(cap, base * 2^(attempt-1))].
+
+    The randomness spreads retries out, so a burst of failures doesn't come back as a
+    synchronized burst of retries (the "thundering herd").
+    """
+    return random.uniform(0, min(cap, base * 2 ** (attempt - 1)))
+
+
+class Worker:
+    def __init__(
+        self,
+        dsn: str,
+        handler: Handler,
+        queue: str = "default",
+        batch: int = 1,
+        visibility_timeout: float = 30.0,
+        poll_interval: float = 1.0,
+        skip_locked: bool = True,
+        ack_batch: bool = True,
+        name: str | None = None,
+        reconnect_delay: float = 1.0,
+        heartbeat: bool = True,
+    ):
+        self.dsn = dsn
+        self.handler = handler
+        self.queue = queue
+        self.batch = batch
+        self.visibility_timeout = visibility_timeout
+        self.poll_interval = poll_interval
+        self.claim_sql = CLAIM_SQL if skip_locked else CLAIM_SQL_BLOCKING
+        # True: ack a claimed batch with one UPDATE after running it (fewer round trips;
+        # a crash mid-batch re-delivers the batch's finished jobs, which idempotency absorbs).
+        self.ack_batch = ack_batch
+        self.name = name or f"{socket.gethostname()}:{os.getpid()}"
+        self.channel = notify_channel(queue)  # validates the queue name
+        self.reconnect_delay = reconnect_delay
+        # While a batch runs, a background thread keeps extending its jobs' leases, so a
+        # healthy worker with a slow handler isn't mistaken for a dead one.
+        self.heartbeat = heartbeat
+        self._connect()
+        self._stopping = False
+        self.processed = 0
+
+    def _connect(self) -> None:
+        self.conn = connect(self.dsn)  # claims, acks, retries
+        self.handler_conn = psycopg.connect(self.dsn)  # handlers run their own transactions here
+        self.listen_conn = connect(self.dsn)  # LISTEN for "new job" notifications
+        self.listen_conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+        self.heartbeat_conn = connect(self.dsn)  # used only by the heartbeat thread
+
+    def _reconnect(self) -> None:
+        """Database went away (restart, failover, network blip): back off and reconnect.
+
+        Whatever was in flight is safe: an uncommitted handler transaction rolled back
+        with the connection, and an un-acked job is re-delivered when its lease expires.
+        """
+        self.close()
+        delay = self.reconnect_delay
+        while not self._stopping:
+            try:
+                self._connect()
+                log.warning("reconnected to the database")
+                return
+            except psycopg.OperationalError as exc:
+                log.warning("database unavailable (%s); retrying in %.1fs", exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+
+    def stop(self, *_: Any) -> None:
+        """Finish the current batch, then exit (graceful shutdown on SIGTERM/SIGINT)."""
+        self._stopping = True
+
+    def claim(self) -> list[Job]:
+        rows = self.conn.execute(
+            self.claim_sql,
+            {"queue": self.queue, "batch": self.batch, "visibility": self.visibility_timeout, "worker": self.name},
+        ).fetchall()
+        return [Job(*row) for row in rows]
+
+    def process(self, job: Job, defer_ack: bool = False) -> bool:
+        """Run one job. Returns True if it succeeded; with defer_ack the caller acks it later."""
+        params = {"id": job.id, "worker": self.name, "attempts": job.attempts}
+        try:
+            self.handler(job, self.handler_conn)
+            self.handler_conn.commit()
+            if CRASH_AFTER_COMMIT and random.random() < CRASH_AFTER_COMMIT:
+                os._exit(137)  # like SIGKILL: effects are committed, the ack never happens
+        except Exception as exc:  # noqa: BLE001 - any handler failure means retry or dead-letter
+            self.handler_conn.rollback()
+            error = f"{type(exc).__name__}: {exc}"[:2000]
+            if job.attempts >= job.max_attempts:
+                self.conn.execute(DEAD_SQL, params | {"error": error})
+                log.warning("job %d dead after %d attempts: %s", job.id, job.attempts, error)
+            else:
+                self.conn.execute(RETRY_SQL, params | {"delay": backoff_seconds(job.attempts), "error": error})
+            return False
+        if defer_ack:
+            return True
+        if self.conn.execute(ACK_SQL, params).rowcount == 0:
+            # Our lease expired and someone else took the job: it will run (again) there.
+            log.warning("job %d: lease lost before ack; another worker owns it now", job.id)
+        self.processed += 1
+        return True
+
+    def _heartbeat_loop(self, jobs: list[Job], stop: threading.Event) -> None:
+        params = {"ids": [j.id for j in jobs], "attempts": [j.attempts for j in jobs],
+                  "worker": self.name, "visibility": self.visibility_timeout}
+        while not stop.wait(self.visibility_timeout / 3):  # renew well before the lease runs out
+            try:
+                self.heartbeat_conn.execute(HEARTBEAT_SQL, params)
+            except psycopg.Error as exc:  # leases then simply expire: the at-least-once fallback
+                log.warning("heartbeat failed: %s", exc)
+                return
+
+    def process_batch(self, jobs: list[Job]) -> None:
+        if not self.heartbeat:
+            return self._process_batch(jobs)
+        stop = threading.Event()
+        beat = threading.Thread(target=self._heartbeat_loop, args=(jobs, stop), daemon=True)
+        beat.start()
+        try:
+            self._process_batch(jobs)
+        finally:
+            stop.set()
+            beat.join()
+
+    def _process_batch(self, jobs: list[Job]) -> None:
+        if not self.ack_batch:
+            for job in jobs:
+                self.process(job)
+            return
+        done = [job for job in jobs if self.process(job, defer_ack=True)]
+        if not done:
+            return
+        acked = self.conn.execute(
+            ACK_MANY_SQL,
+            {"ids": [j.id for j in done], "attempts": [j.attempts for j in done], "worker": self.name},
+        ).rowcount
+        if acked < len(done):
+            log.warning("%d of %d jobs: lease lost before ack", len(done) - acked, len(done))
+        self.processed += acked
+
+    def wait_for_work(self) -> None:
+        """Sleep until a NOTIFY arrives or poll_interval passes (delayed retries need the poll)."""
+        select.select([self.listen_conn.fileno()], [], [], self.poll_interval)
+        for _ in self.listen_conn.notifies(timeout=0):
+            pass  # drain; we only care that something arrived
+
+    def run(self, max_jobs: int | None = None, idle_exit: float | None = None) -> int:
+        """Process jobs until stopped (or `max_jobs` done, or idle for `idle_exit` seconds)."""
+        idle_since = time.monotonic()
+        while not self._stopping and (max_jobs is None or self.processed < max_jobs):
+            try:
+                jobs = self.claim()
+                if not jobs:
+                    if idle_exit is not None and time.monotonic() - idle_since > idle_exit:
+                        break
+                    self.wait_for_work()
+                    continue
+                idle_since = time.monotonic()
+                self.process_batch(jobs)
+            except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+                log.warning("lost the database connection: %s", exc)
+                self._reconnect()
+                idle_since = time.monotonic()
+        return self.processed
+
+    def close(self) -> None:
+        for c in (self.conn, self.handler_conn, self.listen_conn, self.heartbeat_conn):
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001 - closing a dead connection may fail; nothing to do
+                pass
+
+
+def run_worker(dsn: str, handler: Handler, **kwargs: Any) -> None:
+    """Entry point for a worker process, with graceful shutdown on SIGTERM/SIGINT."""
+    worker = Worker(dsn, handler, **kwargs)
+    signal.signal(signal.SIGTERM, worker.stop)
+    signal.signal(signal.SIGINT, worker.stop)
+    try:
+        worker.run()
+    finally:
+        worker.close()
