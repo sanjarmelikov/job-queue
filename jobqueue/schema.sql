@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status           TEXT        NOT NULL DEFAULT 'queued'
                      CHECK (status IN ('queued', 'running', 'done')),
     attempts         INT         NOT NULL DEFAULT 0,
-    max_attempts     INT         NOT NULL DEFAULT 5,
+    max_attempts     INT         NOT NULL DEFAULT 5 CHECK (max_attempts >= 1),
     -- queued: earliest time to run (now, or later after a backoff)
     -- running: when the lease expires and another worker may take over
     run_at           TIMESTAMPTZ NOT NULL DEFAULT now(),

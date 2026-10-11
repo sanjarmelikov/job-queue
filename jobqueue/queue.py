@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from importlib import resources
 from typing import Any
@@ -20,8 +22,19 @@ def init_db(dsn: str) -> None:
         conn.execute(sql)
 
 
+# Queue names end up in a LISTEN channel name, so they're restricted to a safe
+# alphabet; anything else is rejected rather than escaped.
+_QUEUE_NAME = re.compile(r"^[A-Za-z0-9_]{1,50}$")
+
+
+def validate_queue(name: str) -> str:
+    if not isinstance(name, str) or not _QUEUE_NAME.match(name):
+        raise ValueError(f"invalid queue name {name!r}: use 1-50 letters, digits or underscores")
+    return name
+
+
 def notify_channel(queue: str) -> str:
-    return f"jobs_{queue}"
+    return f"jobs_{validate_queue(queue)}"
 
 
 class Queue:
@@ -52,7 +65,13 @@ class Queue:
         max_attempts: int = 5,
     ) -> list[int]:
         """Add many jobs in one round trip. Keys that already exist are skipped (not errors)."""
+        channel = notify_channel(queue)  # validates the queue name
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         keys = idempotency_keys or [None] * len(payloads)
+        for p in payloads:  # serialize now, so a bad payload fails before any SQL runs
+            json.dumps(p)
+        wrapped = [Jsonb(p) for p in payloads]
         with self.conn.transaction():
             rows = self.conn.execute(
                 """
@@ -62,10 +81,11 @@ class Queue:
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING id
                 """,
-                (queue, run_at, max_attempts, [Jsonb(p) for p in payloads], keys),
+                (queue, run_at, max_attempts, wrapped, keys),
             ).fetchall()
             # Wake sleeping workers right away instead of waiting for their next poll.
-            self.conn.execute(f"NOTIFY {notify_channel(queue)}")
+            # pg_notify takes the channel as a parameter: no string-built SQL.
+            self.conn.execute("SELECT pg_notify(%s, '')", (channel,))
         return [r[0] for r in rows]
 
     def stats(self, queue: str = "default") -> dict[str, int]:

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import psycopg
+from psycopg import sql
 
 from jobqueue.queue import connect, notify_channel
 
@@ -120,6 +121,7 @@ class Worker:
         skip_locked: bool = True,
         ack_batch: bool = True,
         name: str | None = None,
+        reconnect_delay: float = 1.0,
     ):
         self.dsn = dsn
         self.handler = handler
@@ -132,12 +134,35 @@ class Worker:
         # a crash mid-batch re-delivers the batch's finished jobs, which idempotency absorbs).
         self.ack_batch = ack_batch
         self.name = name or f"{socket.gethostname()}:{os.getpid()}"
-        self.conn = connect(dsn)  # claims, acks, retries
-        self.handler_conn = psycopg.connect(dsn)  # handlers run their own transactions here
-        self.listen_conn = connect(dsn)  # LISTEN for "new job" notifications
-        self.listen_conn.execute(f"LISTEN {notify_channel(queue)}")
+        self.channel = notify_channel(queue)  # validates the queue name
+        self.reconnect_delay = reconnect_delay
+        self._connect()
         self._stopping = False
         self.processed = 0
+
+    def _connect(self) -> None:
+        self.conn = connect(self.dsn)  # claims, acks, retries
+        self.handler_conn = psycopg.connect(self.dsn)  # handlers run their own transactions here
+        self.listen_conn = connect(self.dsn)  # LISTEN for "new job" notifications
+        self.listen_conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+
+    def _reconnect(self) -> None:
+        """Database went away (restart, failover, network blip): back off and reconnect.
+
+        Whatever was in flight is safe: an uncommitted handler transaction rolled back
+        with the connection, and an un-acked job is re-delivered when its lease expires.
+        """
+        self.close()
+        delay = self.reconnect_delay
+        while not self._stopping:
+            try:
+                self._connect()
+                log.warning("reconnected to the database")
+                return
+            except psycopg.OperationalError as exc:
+                log.warning("database unavailable (%s); retrying in %.1fs", exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
 
     def stop(self, *_: Any) -> None:
         """Finish the current batch, then exit (graceful shutdown on SIGTERM/SIGINT)."""
@@ -201,19 +226,27 @@ class Worker:
         """Process jobs until stopped (or `max_jobs` done, or idle for `idle_exit` seconds)."""
         idle_since = time.monotonic()
         while not self._stopping and (max_jobs is None or self.processed < max_jobs):
-            jobs = self.claim()
-            if not jobs:
-                if idle_exit is not None and time.monotonic() - idle_since > idle_exit:
-                    break
-                self.wait_for_work()
-                continue
-            idle_since = time.monotonic()
-            self.process_batch(jobs)
+            try:
+                jobs = self.claim()
+                if not jobs:
+                    if idle_exit is not None and time.monotonic() - idle_since > idle_exit:
+                        break
+                    self.wait_for_work()
+                    continue
+                idle_since = time.monotonic()
+                self.process_batch(jobs)
+            except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+                log.warning("lost the database connection: %s", exc)
+                self._reconnect()
+                idle_since = time.monotonic()
         return self.processed
 
     def close(self) -> None:
         for c in (self.conn, self.handler_conn, self.listen_conn):
-            c.close()
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001 - closing a dead connection may fail; nothing to do
+                pass
 
 
 def run_worker(dsn: str, handler: Handler, **kwargs: Any) -> None:
