@@ -221,3 +221,6 @@ __marimo__/
 
 # Local benchmark database
 .pgdata/
+
+# Personal study notes (not published)
+notes/
