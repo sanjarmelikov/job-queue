@@ -78,8 +78,8 @@ def test_future_run_at_waits_and_past_run_at_runs_now(dsn):
 
 
 def test_handler_slower_than_lease_runs_twice_but_effect_once(dsn):
-    # A job that outlives its lease is re-delivered to another worker (at-least-once);
-    # the slow worker's late ack is refused, and the idempotent effect lands once.
+    # Without heartbeats (process() alone), a job that outlives its lease is re-delivered
+    # to another worker; the slow worker's late ack is refused; the effect lands once.
     q = Queue(dsn)
     q.enqueue({"value": 1, "sleep": 0.6}, idempotency_key="slow")
     slow = Worker(dsn, record_effect, visibility_timeout=0.3, name="slow")
@@ -155,3 +155,38 @@ def test_failing_handler_does_not_poison_the_batch(dsn):
     w.run(idle_exit=0.5)
     assert set(effects(dsn)) == {"a", "c"} and q.stats()["dead"] == 1
     w.close()
+
+
+def test_heartbeat_keeps_a_slow_but_healthy_job_from_being_redelivered(dsn):
+    q = Queue(dsn)
+    q.enqueue({"value": 1, "sleep": 1.0}, idempotency_key="long")
+    slow = Worker(dsn, record_effect, visibility_timeout=0.3, name="slow")  # heartbeat on by default
+    other = Worker(dsn, record_effect, visibility_timeout=30, name="other")
+    jobs = slow.claim()
+    t = threading.Thread(target=slow.process_batch, args=(jobs,))
+    t.start()
+    stolen = []
+    for _ in range(8):  # for ~0.8 s, well past the 0.3 s lease, keep trying to take it
+        time.sleep(0.1)
+        stolen += other.claim()
+    t.join()
+    assert stolen == [] and effects(dsn) == {"long": 1}  # never re-delivered, ran exactly once
+    with psycopg.connect(dsn) as conn:
+        assert conn.execute("SELECT status, attempts FROM jobs").fetchone() == ("done", 1)
+    slow.close()
+    other.close()
+
+
+def test_without_heartbeat_the_same_job_is_redelivered(dsn):
+    q = Queue(dsn)
+    q.enqueue({"value": 1, "sleep": 1.0}, idempotency_key="long")
+    slow = Worker(dsn, record_effect, visibility_timeout=0.3, name="slow", heartbeat=False)
+    other = Worker(dsn, noop, visibility_timeout=30, name="other")
+    jobs = slow.claim()
+    t = threading.Thread(target=slow.process_batch, args=(jobs,))
+    t.start()
+    time.sleep(0.5)
+    assert len(other.claim()) == 1  # lease expired mid-handler: taken again
+    t.join()
+    slow.close()
+    other.close()

@@ -15,6 +15,7 @@ import random
 import select
 import signal
 import socket
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -72,6 +73,12 @@ UPDATE jobs SET status = 'done', finished_at = now(), locked_by = NULL
 FROM unnest(%(ids)s::bigint[], %(attempts)s::int[]) AS a(id, attempts)
 WHERE jobs.id = a.id AND jobs.attempts = a.attempts AND jobs.locked_by = %(worker)s AND jobs.status = 'running'
 """
+# Extend the lease of jobs this worker is still running (same fencing as acks).
+HEARTBEAT_SQL = """
+UPDATE jobs SET run_at = now() + make_interval(secs => %(visibility)s)
+FROM unnest(%(ids)s::bigint[], %(attempts)s::int[]) AS a(id, attempts)
+WHERE jobs.id = a.id AND jobs.attempts = a.attempts AND jobs.locked_by = %(worker)s AND jobs.status = 'running'
+"""
 RETRY_SQL = """
 UPDATE jobs SET status = 'queued', run_at = now() + make_interval(secs => %(delay)s),
     locked_by = NULL, last_error = %(error)s
@@ -122,6 +129,7 @@ class Worker:
         ack_batch: bool = True,
         name: str | None = None,
         reconnect_delay: float = 1.0,
+        heartbeat: bool = True,
     ):
         self.dsn = dsn
         self.handler = handler
@@ -136,6 +144,9 @@ class Worker:
         self.name = name or f"{socket.gethostname()}:{os.getpid()}"
         self.channel = notify_channel(queue)  # validates the queue name
         self.reconnect_delay = reconnect_delay
+        # While a batch runs, a background thread keeps extending its jobs' leases, so a
+        # healthy worker with a slow handler isn't mistaken for a dead one.
+        self.heartbeat = heartbeat
         self._connect()
         self._stopping = False
         self.processed = 0
@@ -145,6 +156,7 @@ class Worker:
         self.handler_conn = psycopg.connect(self.dsn)  # handlers run their own transactions here
         self.listen_conn = connect(self.dsn)  # LISTEN for "new job" notifications
         self.listen_conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+        self.heartbeat_conn = connect(self.dsn)  # used only by the heartbeat thread
 
     def _reconnect(self) -> None:
         """Database went away (restart, failover, network blip): back off and reconnect.
@@ -200,7 +212,29 @@ class Worker:
         self.processed += 1
         return True
 
+    def _heartbeat_loop(self, jobs: list[Job], stop: threading.Event) -> None:
+        params = {"ids": [j.id for j in jobs], "attempts": [j.attempts for j in jobs],
+                  "worker": self.name, "visibility": self.visibility_timeout}
+        while not stop.wait(self.visibility_timeout / 3):  # renew well before the lease runs out
+            try:
+                self.heartbeat_conn.execute(HEARTBEAT_SQL, params)
+            except psycopg.Error as exc:  # leases then simply expire: the at-least-once fallback
+                log.warning("heartbeat failed: %s", exc)
+                return
+
     def process_batch(self, jobs: list[Job]) -> None:
+        if not self.heartbeat:
+            return self._process_batch(jobs)
+        stop = threading.Event()
+        beat = threading.Thread(target=self._heartbeat_loop, args=(jobs, stop), daemon=True)
+        beat.start()
+        try:
+            self._process_batch(jobs)
+        finally:
+            stop.set()
+            beat.join()
+
+    def _process_batch(self, jobs: list[Job]) -> None:
         if not self.ack_batch:
             for job in jobs:
                 self.process(job)
@@ -242,7 +276,7 @@ class Worker:
         return self.processed
 
     def close(self) -> None:
-        for c in (self.conn, self.handler_conn, self.listen_conn):
+        for c in (self.conn, self.handler_conn, self.listen_conn, self.heartbeat_conn):
             try:
                 c.close()
             except Exception:  # noqa: BLE001 - closing a dead connection may fail; nothing to do
