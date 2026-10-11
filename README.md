@@ -2,6 +2,14 @@
 
 A durable job queue in Python on PostgreSQL, with at-least-once delivery. Workers claim jobs with `FOR UPDATE SKIP LOCKED`; a claim is a lease (visibility timeout), so a crashed worker's job is re-delivered; failures retry with exponential backoff; jobs that keep failing go to a dead-letter table. Idempotency keys make duplicate deliveries harmless.
 
+## Highlights
+
+| Claim | Evidence |
+|---|---|
+| `FOR UPDATE SKIP LOCKED` claims, leases with heartbeats, backoff with jitter, dead letters; **at-least-once across 8 concurrent workers** | [Design](#design), `jobqueue/worker.py` |
+| **Fault injection: 0 of 10,000 jobs lost** across 66 crashes (SIGKILLs + crashes between commit and ack); **54 duplicates absorbed** by idempotency keys | [Fault injection](#fault-injection-0-of-10000-jobs-lost), `results/fault_injection.jsonl` |
+| **24K jobs/s** drain; **p95 enqueue-to-start under 4 ms at 5,000 jobs/s**; SKIP LOCKED **3.5×** vs blocking locks; batched acks **+43%** | [Throughput](#throughput), `results/load_test.jsonl` |
+
 ```python
 from jobqueue import Queue, Worker
 from jobqueue.examples import record_effect
