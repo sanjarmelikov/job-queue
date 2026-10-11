@@ -27,6 +27,7 @@ Checked end to end with `docker-compose` on Colima: 2,000 jobs enqueued from the
 | **Dead letters** | After `max_attempts`, the job moves (in one statement) to `dead_letters` with its last error. |
 | **Idempotency** | Enqueue: a unique `idempotency_key` makes re-enqueueing a no-op. Processing: handlers record their effect under the same key (`examples.record_effect`), so a re-delivered job can't apply its effect twice. |
 | **Wake-ups** | `NOTIFY` on enqueue wakes idle workers immediately (`LISTEN`), with polling as a fallback for delayed retries. |
+| **Heartbeats** | While a batch runs, a background thread (own connection) renews its leases every `visibility_timeout/3`, so a slow-but-healthy job isn't re-delivered; a dead worker's leases still expire normally. |
 | **Batched acks** | Successful jobs in a claimed batch are acknowledged with one `UPDATE … FROM unnest(ids, attempts)`. `--ack-each` acks one at a time. |
 | **Shutdown** | SIGTERM/SIGINT finishes the current batch, then exits. |
 
